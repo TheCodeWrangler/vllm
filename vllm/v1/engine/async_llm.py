@@ -6,6 +6,7 @@ import socket
 import time
 import warnings
 from collections.abc import AsyncGenerator, Iterable, Mapping
+from contextlib import contextmanager
 from copy import copy
 from typing import Any
 
@@ -77,6 +78,11 @@ class InputStreamError(Exception):
 
 class AsyncLLM(EngineClient):
     """An asynchronous wrapper for the vLLM engine."""
+
+    # Slots handed out by admission control that are not yet visible in
+    # ``output_processor.request_states``.  Class-level default so instances
+    # built with ``__new__`` still read a sane value.
+    _pending_admissions: int = 0
 
     def __init__(
         self,
@@ -313,7 +319,7 @@ class AsyncLLM(EngineClient):
         """
         max_num_reqs = self.scheduler_config.max_num_queued_reqs
         if max_num_reqs is not None:
-            current = self.get_num_unfinished_requests()
+            current = self.get_num_unfinished_requests() + self._pending_admissions
             if current + n > max_num_reqs:
                 logger.info(
                     "Request queue full - rejecting request %s "
@@ -369,6 +375,74 @@ class AsyncLLM(EngineClient):
         if self.errored:
             raise EngineDeadError()
 
+        # Admission control.  Entrypoints pre-flight ``check_admission`` so
+        # that rejections carry an HTTP status; paths without one (beam
+        # search, the realtime WebSocket) are gated here.  The slots stay
+        # reserved for the whole call because the request only becomes
+        # visible to ``check_admission`` once ``_add_request`` registers it,
+        # several awaits later.
+        with self._admission_reservation(getattr(params, "n", 1) or 1, request_id):
+            return await self._add_admitted_request(
+                request_id=request_id,
+                prompt=prompt,
+                params=params,
+                arrival_time=arrival_time,
+                lora_request=lora_request,
+                tokenization_kwargs=tokenization_kwargs,
+                trace_headers=trace_headers,
+                priority=priority,
+                data_parallel_rank=data_parallel_rank,
+                session_id=session_id,
+                prompt_text=prompt_text,
+                reasoning_ended=reasoning_ended,
+                reasoning_parser_kwargs=reasoning_parser_kwargs,
+            )
+
+    @contextmanager
+    def _admission_reservation(self, n: int, request_id: str | None = None):
+        """Admit the request and hold ``n`` slots until it is registered.
+
+        ``check_admission`` only reads the current in-flight count.  On its
+        own that is a TOCTOU: the request lands in
+        ``output_processor.request_states`` in ``_add_request``, after
+        ``get_supported_tasks()`` and ``process_inputs_async()`` have
+        yielded, so a burst of concurrent arrivals all read the same stale
+        count, all pass, and collectively overshoot the limit.  Reserving
+        the slots up front closes it: the read in ``check_admission`` and
+        the increment below happen with no await in between, so they are
+        atomic with respect to other coroutines.
+        """
+        self.check_admission(n, request_id)
+        self._pending_admissions += n
+        try:
+            yield
+        finally:
+            self._pending_admissions -= n
+
+    async def _add_admitted_request(
+        self,
+        request_id: str,
+        prompt: EngineCoreRequest
+        | PromptType
+        | EngineInput
+        | AsyncGenerator[StreamingInput, None],
+        params: SamplingParams | PoolingParams,
+        arrival_time: float | None = None,
+        lora_request: LoRARequest | None = None,
+        tokenization_kwargs: dict[str, Any] | None = None,
+        trace_headers: Mapping[str, str] | None = None,
+        priority: int = 0,
+        data_parallel_rank: int | None = None,
+        session_id: str | None = None,
+        prompt_text: str | None = None,
+        reasoning_ended: bool | None = None,
+        reasoning_parser_kwargs: dict[str, Any] | None = None,
+    ) -> RequestOutputCollector:
+        """Add new request to the AsyncLLM."""
+
+        if self.errored:
+            raise EngineDeadError()
+
         is_pooling = isinstance(params, PoolingParams)
 
         if (
@@ -381,11 +455,6 @@ class AsyncLLM(EngineClient):
                 "prompt tokens, please disable it when the requests need "
                 "prompt logprobs"
             )
-
-        # Enforcement backstop: entrypoints pre-flight this check so that
-        # rejections carry an HTTP status, but paths without one (beam search,
-        # the realtime WebSocket) are only gated here.
-        self.check_admission(getattr(params, "n", 1) or 1, request_id)
 
         if isinstance(prompt, AsyncGenerator):
             if reasoning_ended is not None or reasoning_parser_kwargs is not None:

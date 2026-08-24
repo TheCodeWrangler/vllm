@@ -13,6 +13,7 @@ These tests cover:
 """
 
 import argparse
+import asyncio
 from http import HTTPStatus
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -21,7 +22,9 @@ import pytest
 from pydantic import ValidationError
 
 from vllm.config.scheduler import SchedulerConfig
-from vllm.entrypoints.serve.utils.error_response import create_error_response
+from vllm.entrypoints.serve.exception_handling.error_response import (
+    create_error_response,
+)
 from vllm.exceptions import (
     GracefulHTTPError,
     MaxQueuedTokensError,
@@ -336,3 +339,73 @@ def test_human_readable_int_parses_notation(input_str: str, expected: int):
 def test_human_readable_int_rejects_invalid(invalid: str):
     with pytest.raises((argparse.ArgumentTypeError, ValueError)):
         human_readable_int(invalid)
+
+
+# ---------------------------------------------------------------------------
+# Concurrent admission (reservation)
+# ---------------------------------------------------------------------------
+
+
+def _real_output_processor() -> OutputProcessor:
+    op = OutputProcessor.__new__(OutputProcessor)
+    op.request_states = {}
+    return op
+
+
+def test_concurrent_arrivals_cannot_overshoot_req_limit():
+    """A burst must not collectively exceed ``max_num_queued_reqs``.
+
+    ``check_admission`` reads the in-flight count, but the request only lands
+    in ``output_processor.request_states`` several awaits later (tokenization,
+    IPC).  Holding the slot across those awaits is what keeps the limit honest.
+    """
+    limit = 8
+    arrivals = 64
+
+    llm = _make_async_llm(max_num_queued_reqs=limit)
+    llm.output_processor = _real_output_processor()
+
+    async def add(request_id: str) -> bool:
+        try:
+            with llm._admission_reservation(1, request_id):
+                # Stand-ins for `await self.get_supported_tasks()` and
+                # `await self.input_processor.process_inputs_async(...)`.
+                await asyncio.sleep(0)
+                await asyncio.sleep(0)
+                llm.output_processor.request_states[request_id] = _make_req_state(16)
+        except QueueOverflowError:
+            return False
+        return True
+
+    async def main() -> list[bool]:
+        return await asyncio.gather(*(add(f"req-{i}") for i in range(arrivals)))
+
+    admitted = sum(asyncio.run(main()))
+    assert admitted == limit
+    assert llm.output_processor.get_num_unfinished_requests() == limit
+
+
+def test_reservation_is_released_when_body_raises():
+    llm = _make_async_llm(max_num_queued_reqs=1)
+    llm.output_processor = _real_output_processor()
+
+    with pytest.raises(RuntimeError), llm._admission_reservation(1, "req-0"):
+        raise RuntimeError("tokenization failed")
+
+    assert llm._pending_admissions == 0
+    # The slot is free again.
+    with llm._admission_reservation(1, "req-1"):
+        pass
+
+
+def test_reservation_counts_n_slots():
+    llm = _make_async_llm(max_num_queued_reqs=4)
+    llm.output_processor = _real_output_processor()
+
+    with llm._admission_reservation(3, "req-0"):
+        assert llm._pending_admissions == 3
+        with pytest.raises(QueueOverflowError), llm._admission_reservation(2, "req-1"):
+            pass
+        # Still exactly the 3 held by req-0.
+        assert llm._pending_admissions == 3
+    assert llm._pending_admissions == 0
